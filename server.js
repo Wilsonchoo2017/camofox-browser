@@ -21,6 +21,7 @@ import {
   getDownloadsList,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
+import { rand as _rand, randomPointInBox as _randomPointInBox } from './lib/humanize.js';
 import { extractDeterministic, validateSchema as validateExtractSchema } from './lib/extract.js';
 import {
   ensureTracesDir, resolveTracePath, tracePathFor, makeTraceFilename,
@@ -3523,9 +3524,8 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
       const clickStart = Date.now();
       const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
-      // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
-      // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
-      const dispatchMouseSequence = async (locator) => {
+      // Resolve the element's box and glide the cursor onto a random point in it.
+      const moveToElement = async (locator) => {
         // boundingBox() with no timeout inherits Playwright's 30s default, which
         // silently eats the entire handler budget when the element detached after
         // the failed click attempt (the page changed under us). Bound it to the
@@ -3545,16 +3545,32 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         }
         if (!box) throw new Error('Element not visible (no bounding box)');
         
-        const x = box.x + box.width / 2;
-        const y = box.y + box.height / 2;
-        
-        // Move mouse to element (triggers mouseover/mouseenter)
+        // Natural movement: aim at a random point within the element instead of
+        // dead center (bot tell); Camoufox's humanize expands this single move
+        // into the eased, jittered multi-segment path.
+        const { x, y } = _randomPointInBox(box);
         await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
-        await tabState.page.waitForTimeout(50);
-        
-        // Full click sequence
+        await tabState.page.waitForTimeout(_rand(40, 120));
+        return { x, y };
+      };
+      
+      // Glide the cursor onto the element before any click attempt. Best-effort:
+      // the click that follows does its own actionability checks and reports the
+      // real failure, so a glide failure must not mask it.
+      const glideToElement = async (locator) => {
+        try {
+          await moveToElement(locator);
+        } catch (glideErr) {
+          log('warn', 'natural mouse glide failed', { err: glideErr.message });
+        }
+      };
+      
+      // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
+      // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
+      const dispatchMouseSequence = async (locator) => {
+        const { x, y } = await moveToElement(locator);
         await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
-        await tabState.page.waitForTimeout(50);
+        await tabState.page.waitForTimeout(_rand(40, 120));
         await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
@@ -3567,6 +3583,12 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       const doClick = async (locatorOrSelector, isLocator) => {
         const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
         const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
+        
+        // Anti-bot: ease the cursor to the target before clicking, so the click
+        // is preceded by a visible multi-segment path instead of a teleport.
+        // The click itself still runs through Playwright so obscured/detached
+        // elements are still detected.
+        await glideToElement(locator);
         
         if (onGoogleSerp) {
           try {
